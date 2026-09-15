@@ -5,6 +5,7 @@ RENA License Server
 - HWID リセット可能
 - 有効期限を設定可能
 - ライセンスを停止 / 再開可能
+- ライセンスを完全削除可能
 """
 import os
 import time
@@ -328,6 +329,33 @@ def admin_toggle():
                     "reason": "有効化しました" if active else "停止しました"})
 
 
+@app.route("/admin/delete", methods=["POST"])
+def admin_delete():
+    """ライセンスを完全削除
+    { "admin_secret":"...", "license_key":"RENA-..." }
+    """
+    data = request.get_json(silent=True) or {}
+    if not _check_admin(data):
+        return jsonify({"ok": False, "reason": "Unauthorized"}), 401
+    key = (data.get("license_key") or "").strip()
+    if not key:
+        return jsonify({"ok": False, "reason": "キーが空です"}), 400
+
+    c = _conn()
+    cur = c.cursor()
+    # 存在チェック
+    cur.execute(_ph("SELECT 1 FROM licenses WHERE license_key=?"), (key,))
+    if not cur.fetchone():
+        c.close()
+        return jsonify({"ok": False, "reason": "キーが存在しません"}), 404
+
+    cur.execute(_ph("DELETE FROM sessions WHERE license_key=?"), (key,))
+    cur.execute(_ph("DELETE FROM licenses WHERE license_key=?"), (key,))
+    c.commit()
+    c.close()
+    return jsonify({"ok": True, "reason": "ライセンスを削除しました"})
+
+
 @app.route("/admin/info", methods=["POST"])
 def admin_info():
     """キーの状態を取得
@@ -371,8 +399,8 @@ def admin_list():
     c = _conn()
     cur = c.cursor()
     cur.execute(_ph(
-        "SELECT license_key, hwid, expiry_date, active "
-        "FROM licenses ORDER BY created_at DESC"
+        "SELECT license_key, hwid, expiry_date, max_launches, launch_count, "
+        "active, created_at FROM licenses ORDER BY created_at DESC"
     ))
     rows = cur.fetchall()
     c.close()
@@ -380,7 +408,10 @@ def admin_list():
         "license_key": r[0],
         "hwid": r[1],
         "expiry": r[2],
-        "active": bool(r[3]),
+        "max_launches": r[3],
+        "launch_count": r[4],
+        "active": bool(r[5]),
+        "created_at": r[6],
     } for r in rows]
     return jsonify({"ok": True, "licenses": keys})
 
