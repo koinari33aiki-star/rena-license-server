@@ -247,7 +247,8 @@ def admin_generate():
     c = _conn()
     cur = c.cursor()
     for _ in range(count):
-        k = "RENA-" + secrets.token_hex(16).upper()
+        # ★ プレフィックス無しのライセンスキー
+        k = secrets.token_hex(16).upper()
         cur.execute(_ph(
             "INSERT INTO licenses (license_key, hwid, expiry_date, "
             "max_launches, launch_count, active, created_at, last_seen_ts) "
@@ -263,7 +264,7 @@ def admin_generate():
 @app.route("/admin/reset_hwid", methods=["POST"])
 def admin_reset_hwid():
     """HWリセット: キーの HWID バインドを解除して別PCで使えるようにする
-    { "admin_secret":"...", "license_key":"RENA-..." }
+    { "admin_secret":"...", "license_key":"..." }
     """
     data = request.get_json(silent=True) or {}
     if not _check_admin(data):
@@ -284,7 +285,7 @@ def admin_reset_hwid():
 @app.route("/admin/set_expiry", methods=["POST"])
 def admin_set_expiry():
     """有効期限を設定 / 変更 / 無期限化
-    { "admin_secret":"...", "license_key":"RENA-...", "expiry":"2026-12-31" or null }
+    { "admin_secret":"...", "license_key":"...", "expiry":"2026-12-31" or null }
     """
     data = request.get_json(silent=True) or {}
     if not _check_admin(data):
@@ -307,7 +308,7 @@ def admin_set_expiry():
 @app.route("/admin/toggle", methods=["POST"])
 def admin_toggle():
     """ライセンスの停止 / 開始
-    { "admin_secret":"...", "license_key":"RENA-...", "active": true/false }
+    { "admin_secret":"...", "license_key":"...", "active": true/false }
     """
     data = request.get_json(silent=True) or {}
     if not _check_admin(data):
@@ -332,7 +333,7 @@ def admin_toggle():
 @app.route("/admin/delete", methods=["POST"])
 def admin_delete():
     """ライセンスを完全削除
-    { "admin_secret":"...", "license_key":"RENA-..." }
+    { "admin_secret":"...", "license_key":"..." }
     """
     data = request.get_json(silent=True) or {}
     if not _check_admin(data):
@@ -359,7 +360,7 @@ def admin_delete():
 @app.route("/admin/info", methods=["POST"])
 def admin_info():
     """キーの状態を取得
-    { "admin_secret":"...", "license_key":"RENA-..." }
+    { "admin_secret":"...", "license_key":"..." }
     """
     data = request.get_json(silent=True) or {}
     if not _check_admin(data):
