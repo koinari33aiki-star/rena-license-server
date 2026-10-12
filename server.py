@@ -11,13 +11,15 @@ RENA License Server
   1) before_request  : リクエスト毎に間引きスイープ（スリープ復帰対策）
   2) 常駐スレッド    : 一定間隔でスイープ
   3) /admin/expire_sweep : 外部cronから叩ける
+
+日付判定はすべて JST（日本時間 UTC+9）基準。
 """
 import os
 import time
 import secrets
 import sqlite3
 import threading
-from datetime import datetime, date
+from datetime import datetime, date, timezone, timedelta
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
@@ -29,6 +31,17 @@ SWEEP_INTERVAL = int(os.environ.get("EXPIRE_SWEEP_INTERVAL", 60))  # 秒
 
 if USE_PG:
     import psycopg2
+
+
+# ===================================================================
+# 日本時間 (UTC+9)
+# ===================================================================
+JST = timezone(timedelta(hours=9))
+
+
+def _today_jst():
+    """日本時間の今日の日付を返す"""
+    return datetime.now(JST).date()
 
 
 def _conn():
@@ -87,7 +100,7 @@ _sweep_lock = threading.Lock()
 def _expire_sweep():
     """期限切れのライセンスを一括で active=0 にする（冪等）"""
     global _sweep_count
-    today_str = date.today().isoformat()
+    today_str = _today_jst().isoformat()
     affected = 0
     try:
         c = _conn()
@@ -179,7 +192,7 @@ def health():
     return jsonify({
         "status": "ok",
         "service": "RENA License Server",
-        "today": date.today().isoformat(),
+        "today": _today_jst().isoformat(),
         "sweep_count": _sweep_count,
         "last_sweep_ago": round(time.time() - _last_sweep_ts, 1),
     })
@@ -215,7 +228,7 @@ def activate():
     if expiry_date:
         try:
             exp = datetime.strptime(expiry_date, "%Y-%m-%d").date()
-            if date.today() > exp:
+            if _today_jst() > exp:
                 if active:
                     cur.execute(_ph("UPDATE licenses SET active=0 WHERE license_key=?"), (key,))
                     c.commit()
@@ -310,7 +323,7 @@ def heartbeat():
     if expiry_date:
         try:
             exp = datetime.strptime(expiry_date, "%Y-%m-%d").date()
-            if date.today() > exp:
+            if _today_jst() > exp:
                 if active:
                     cur.execute(_ph("UPDATE licenses SET active=0 WHERE license_key=?"), (license_key,))
                     c.commit()
@@ -514,8 +527,8 @@ def admin_list():
     c = _conn()
     cur = c.cursor()
 
-    # 一覧取得時にも念のため期限切れを一括停止
-    today_str = date.today().isoformat()
+    # 一覧取得時にも念のため期限切れを一括停止（JST基準）
+    today_str = _today_jst().isoformat()
     cur.execute(_ph(
         "UPDATE licenses SET active = 0 WHERE active = 1 "
         "AND expiry_date IS NOT NULL AND expiry_date < ?"
@@ -561,7 +574,7 @@ def admin_sweeper_status():
     if not _check_admin(data):
         return jsonify({"ok": False, "reason": "Unauthorized"}), 401
 
-    today_str = date.today().isoformat()
+    today_str = _today_jst().isoformat()
     pending = -1
     try:
         c = _conn()
