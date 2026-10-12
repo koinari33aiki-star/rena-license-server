@@ -103,6 +103,20 @@ def activate():
 
     stored_hwid, expiry_date, max_launches, launch_count, active = row
 
+    # 期限チェック (期限切れの場合は自動で active = 0 に更新)
+    if expiry_date:
+        try:
+            exp = datetime.strptime(expiry_date, "%Y-%m-%d").date()
+            if date.today() > exp:
+                if active:
+                    cur.execute(_ph("UPDATE licenses SET active=0 WHERE license_key=?"), (key,))
+                    c.commit()
+                c.close()
+                return jsonify({"ok": False,
+                                "reason": f"有効期限切れ ({expiry_date})"}), 403
+        except ValueError:
+            pass
+
     if not active:
         c.close()
         return jsonify({"ok": False, "reason": "このライセンスは停止中です"}), 403
@@ -117,17 +131,6 @@ def activate():
             "ok": False,
             "reason": "このキーは別のPCに紐付いています。管理者にHWリセットを依頼してください。"
         }), 403
-
-    # 期限チェック
-    if expiry_date:
-        try:
-            exp = datetime.strptime(expiry_date, "%Y-%m-%d").date()
-            if date.today() > exp:
-                c.close()
-                return jsonify({"ok": False,
-                                "reason": f"有効期限切れ ({expiry_date})"}), 403
-        except ValueError:
-            pass
 
     # 起動回数
     launch_count = (launch_count or 0) + 1
@@ -195,19 +198,23 @@ def heartbeat():
 
     expiry_date, max_launches, launch_count, active = lic
 
-    if not active:
-        c.close()
-        return jsonify({"ok": False, "reason": "ライセンスが停止中です"}), 403
-
+    # 期限チェック
     if expiry_date:
         try:
             exp = datetime.strptime(expiry_date, "%Y-%m-%d").date()
             if date.today() > exp:
+                if active:
+                    cur.execute(_ph("UPDATE licenses SET active=0 WHERE license_key=?"), (license_key,))
+                    c.commit()
                 c.close()
                 return jsonify({"ok": False,
                                 "reason": f"有効期限切れ ({expiry_date})"}), 403
         except ValueError:
             pass
+
+    if not active:
+        c.close()
+        return jsonify({"ok": False, "reason": "ライセンスが停止中です"}), 403
 
     now = time.time()
     cur.execute(_ph("UPDATE sessions SET last_heartbeat=? WHERE token=?"),
@@ -237,9 +244,9 @@ def admin_generate():
     """
     data = request.get_json(silent=True) or {}
     if not _check_admin(data):
-        return jsonify({"ok": False, "reason": "Unauthorized"}), 401
+        return jsonify({"ok": False, "reason": "Unauthorized"}}, 401
 
-    expiry = data.get("expiry")           # "YYYY-MM-DD" or None
+    expiry = data.get("expiry")            # "YYYY-MM-DD" or None
     max_launches = int(data.get("max_launches", 0))
     count = max(1, int(data.get("count", 1)))
 
@@ -247,7 +254,7 @@ def admin_generate():
     c = _conn()
     cur = c.cursor()
     for _ in range(count):
-        # ★ プレフィックス無しのライセンスキー
+        # プレフィックス無しのライセンスキー
         k = secrets.token_hex(16).upper()
         cur.execute(_ph(
             "INSERT INTO licenses (license_key, hwid, expiry_date, "
@@ -344,7 +351,6 @@ def admin_delete():
 
     c = _conn()
     cur = c.cursor()
-    # 存在チェック
     cur.execute(_ph("SELECT 1 FROM licenses WHERE license_key=?"), (key,))
     if not cur.fetchone():
         c.close()
@@ -397,9 +403,21 @@ def admin_list():
     data = request.get_json(silent=True) or {}
     if not _check_admin(data):
         return jsonify({"ok": False, "reason": "Unauthorized"}), 401
+    
     c = _conn()
     cur = c.cursor()
+
+    # ★ 一覧取得時に期限切れかつ有効なキーをデータベース上で自動的に一括停止（active = 0）にする
+    today_str = date.today().isoformat()
     cur.execute(_ph(
+        "UPDATE licenses SET active = 0 WHERE active = 1 AND expiry_date IS NOT NULL AND expiry_date < ?"
+    ), (today_str,))
+    c.commit()
+
+    cur.execute(_ph(
+        "SELECT license_key, hwid, expiry_date, max_launches, launch_count, "
+        "active, created_key FROM licenses ORDER BY created_at DESC" # Note: table uses created_at
+    ) if False else _ph(
         "SELECT license_key, hwid, expiry_date, max_launches, launch_count, "
         "active, created_at FROM licenses ORDER BY created_at DESC"
     ))
