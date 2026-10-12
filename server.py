@@ -6,6 +6,11 @@ RENA License Server
 - 有効期限を設定可能（期限切れは自動で即時停止）
 - ライセンスを停止 / 再開可能
 - ライセンスを完全削除可能
+
+期限切れ自動停止は3段構え:
+  1) before_request  : リクエスト毎に間引きスイープ（スリープ復帰対策）
+  2) 常駐スレッド    : 一定間隔でスイープ
+  3) /admin/expire_sweep : 外部cronから叩ける
 """
 import os
 import time
@@ -20,6 +25,7 @@ app = Flask(__name__)
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "change_me_please")
 USE_PG = DATABASE_URL.startswith("postgres")
+SWEEP_INTERVAL = int(os.environ.get("EXPIRE_SWEEP_INTERVAL", 60))  # 秒
 
 if USE_PG:
     import psycopg2
@@ -73,12 +79,16 @@ def _check_admin(data):
 # ===================================================================
 # 期限切れ自動スイープ
 # ===================================================================
-SWEEP_INTERVAL = int(os.environ.get("EXPIRE_SWEEP_INTERVAL", 60))  # 秒
+_sweep_count = 0
+_last_sweep_ts = 0.0
+_sweep_lock = threading.Lock()
 
 
 def _expire_sweep():
-    """期限切れのライセンスを一括で active=0 にする"""
+    """期限切れのライセンスを一括で active=0 にする（冪等）"""
+    global _sweep_count
     today_str = date.today().isoformat()
+    affected = 0
     try:
         c = _conn()
         cur = c.cursor()
@@ -88,7 +98,7 @@ def _expire_sweep():
         ), (today_str,))
         affected = cur.rowcount if cur.rowcount is not None else 0
 
-        # 期限切れになったキーのセッションも無効化
+        # 期限切れキーのセッションも無効化
         cur.execute(_ph(
             "DELETE FROM sessions WHERE license_key IN ("
             "  SELECT license_key FROM licenses "
@@ -97,39 +107,68 @@ def _expire_sweep():
         ), (today_str,))
         c.commit()
         c.close()
-        if affected:
-            print(f"[expire_sweep] {affected} 件を停止しました ({today_str})")
-        return affected
     except Exception as e:
-        print(f"[expire_sweep] error: {e}")
+        print(f"[expire_sweep] ERROR: {e}")
         return 0
 
+    _sweep_count += 1
+    if affected or _sweep_count % 10 == 1:
+        print(f"[expire_sweep] #{_sweep_count} today={today_str} stopped={affected}")
+    return affected
 
+
+def _maybe_sweep():
+    """前回から SWEEP_INTERVAL 秒以上経過していればスイープ。
+    リクエスト毎に呼ばれるので、スリープ復帰直後でも必ず走る。"""
+    global _last_sweep_ts
+    now = time.time()
+    with _sweep_lock:
+        if now - _last_sweep_ts < SWEEP_INTERVAL:
+            return 0
+        _last_sweep_ts = now
+    return _expire_sweep()
+
+
+# ---- 常駐スレッド ----
 _sweeper_started = False
-_sweeper_lock = threading.Lock()
+_sweeper_start_lock = threading.Lock()
 
 
 def _start_expire_sweeper():
-    """常駐スイープスレッドを起動（多重起動防止付き）"""
     global _sweeper_started
-    with _sweeper_lock:
+    with _sweeper_start_lock:
         if _sweeper_started:
             return
         _sweeper_started = True
 
     def loop():
         while True:
-            _expire_sweep()
+            try:
+                _expire_sweep()
+                global _last_sweep_ts
+                _last_sweep_ts = time.time()
+            except Exception as e:
+                print(f"[expire_sweep thread] {e}")
             time.sleep(SWEEP_INTERVAL)
 
     t = threading.Thread(target=loop, daemon=True, name="expire-sweeper")
     t.start()
-    print(f"[expire_sweep] スイープ開始（{SWEEP_INTERVAL}秒間隔）")
+    print(f"[expire_sweep] thread started (interval={SWEEP_INTERVAL}s)")
 
 
-# 起動時にまず既存の期限切れを一掃 → 常駐スイープ開始
+# 起動時に既存の期限切れを一掃 → 常駐スレッド起動
 _expire_sweep()
+_last_sweep_ts = time.time()
 _start_expire_sweeper()
+
+
+# ---- リクエスト毎の保険スイープ ----
+@app.before_request
+def _sweep_on_request():
+    try:
+        _maybe_sweep()
+    except Exception as e:
+        print(f"[before_request sweep] {e}")
 
 
 # ===================================================================
@@ -137,7 +176,13 @@ _start_expire_sweeper()
 # ===================================================================
 @app.route("/")
 def health():
-    return jsonify({"status": "ok", "service": "RENA License Server"})
+    return jsonify({
+        "status": "ok",
+        "service": "RENA License Server",
+        "today": date.today().isoformat(),
+        "sweep_count": _sweep_count,
+        "last_sweep_ago": round(time.time() - _last_sweep_ts, 1),
+    })
 
 
 # ===================================================================
@@ -469,7 +514,7 @@ def admin_list():
     c = _conn()
     cur = c.cursor()
 
-    # 一覧取得時にも念のため期限切れを一括停止（スイープの保険）
+    # 一覧取得時にも念のため期限切れを一括停止
     today_str = date.today().isoformat()
     cur.execute(_ph(
         "UPDATE licenses SET active = 0 WHERE active = 1 "
@@ -505,6 +550,41 @@ def admin_expire_sweep():
         return jsonify({"ok": False, "reason": "Unauthorized"}), 401
     affected = _expire_sweep()
     return jsonify({"ok": True, "stopped": affected})
+
+
+@app.route("/admin/sweeper_status", methods=["POST"])
+def admin_sweeper_status():
+    """スイープの生存確認・診断用
+    { "admin_secret":"..." }
+    """
+    data = request.get_json(silent=True) or {}
+    if not _check_admin(data):
+        return jsonify({"ok": False, "reason": "Unauthorized"}), 401
+
+    today_str = date.today().isoformat()
+    pending = -1
+    try:
+        c = _conn()
+        cur = c.cursor()
+        cur.execute(_ph(
+            "SELECT COUNT(*) FROM licenses "
+            "WHERE active=1 AND expiry_date IS NOT NULL AND expiry_date < ?"
+        ), (today_str,))
+        pending = cur.fetchone()[0]
+        c.close()
+    except Exception as e:
+        print(f"[sweeper_status] {e}")
+
+    return jsonify({
+        "ok": True,
+        "today": today_str,
+        "sweep_interval_sec": SWEEP_INTERVAL,
+        "sweep_count": _sweep_count,
+        "last_sweep_ago_sec": round(time.time() - _last_sweep_ts, 1),
+        "thread_started": _sweeper_started,
+        # 0 なら正常。1以上なら「止めるべきキーが残っている」= スイープ未実行
+        "pending_expired_active": pending,
+    })
 
 
 if __name__ == "__main__":
