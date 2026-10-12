@@ -244,7 +244,7 @@ def admin_generate():
     """
     data = request.get_json(silent=True) or {}
     if not _check_admin(data):
-        return jsonify({"ok": False, "reason": "Unauthorized"}}, 401
+        return jsonify({"ok": False, "reason": "Unauthorized"}), 401
 
     expiry = data.get("expiry")            # "YYYY-MM-DD" or None
     max_launches = int(data.get("max_launches", 0))
@@ -254,7 +254,6 @@ def admin_generate():
     c = _conn()
     cur = c.cursor()
     for _ in range(count):
-        # プレフィックス無しのライセンスキー
         k = secrets.token_hex(16).upper()
         cur.execute(_ph(
             "INSERT INTO licenses (license_key, hwid, expiry_date, "
@@ -300,7 +299,7 @@ def admin_set_expiry():
     key = (data.get("license_key") or "").strip()
     if not key:
         return jsonify({"ok": False, "reason": "キーが空です"}), 400
-    expiry = data.get("expiry")  # None で無期限
+    expiry = data.get("expiry")
 
     c = _conn()
     cur = c.cursor()
@@ -407,7 +406,7 @@ def admin_list():
     c = _conn()
     cur = c.cursor()
 
-    # ★ 一覧取得時に期限切れかつ有効なキーをデータベース上で自動的に一括停止（active = 0）にする
+    # 一覧取得時に期限切れかつ有効なキーをデータベース上で自動的に一括停止（active = 0）にする
     today_str = date.today().isoformat()
     cur.execute(_ph(
         "UPDATE licenses SET active = 0 WHERE active = 1 AND expiry_date IS NOT NULL AND expiry_date < ?"
@@ -415,9 +414,6 @@ def admin_list():
     c.commit()
 
     cur.execute(_ph(
-        "SELECT license_key, hwid, expiry_date, max_launches, launch_count, "
-        "active, created_key FROM licenses ORDER BY created_at DESC" # Note: table uses created_at
-    ) if False else _ph(
         "SELECT license_key, hwid, expiry_date, max_launches, launch_count, "
         "active, created_at FROM licenses ORDER BY created_at DESC"
     ))
