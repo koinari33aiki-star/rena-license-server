@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-RENA License Server
+RENA License Server (サーバー.py)
 - 1ライセンスキー = 1PC (HWID バインド)
 - HWID リセット可能
 - 有効期限を設定可能（期限切れは自動で即時停止）
@@ -9,18 +9,32 @@ RENA License Server
 
 期限切れ自動停止は3段構え:
   1) before_request  : リクエスト毎に間引きスイープ（スリープ復帰対策）
-  2) 常駐スレッド    : 一定間隔でスイープ
+     ※ ヘルスチェック "/" は DB に触らない
+  2) 常駐スレッド    : 一定間隔でスイープ（多重起動はファイルロックで防止）
   3) /admin/expire_sweep : 外部cronから叩ける
 
 日付判定はすべて JST（日本時間 UTC+9）基準。
+
+[修正内容]
+- DB 接続に connect_timeout を設定（ハング防止）
+- 全 DB 操作を contextmanager で close 保証（接続枯渇防止）
+- 起動時の init / sweep 失敗でプロセスが落ちないように
+- ヘルスチェックでは sweep をスキップ
+- スイーパースレッドの多重起動をファイルロックで防止
 """
 import os
 import time
 import secrets
 import sqlite3
 import threading
+from contextlib import contextmanager
 from datetime import datetime, date, timezone, timedelta
 from flask import Flask, request, jsonify
+
+try:
+    import fcntl
+except ImportError:  # Windows ローカル開発時
+    fcntl = None
 
 app = Flask(__name__)
 
@@ -28,6 +42,8 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "")
 ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "change_me_please")
 USE_PG = DATABASE_URL.startswith("postgres")
 SWEEP_INTERVAL = int(os.environ.get("EXPIRE_SWEEP_INTERVAL", 60))  # 秒
+DB_CONNECT_TIMEOUT = int(os.environ.get("DB_CONNECT_TIMEOUT", 5))  # 秒
+SWEEPER_LOCK_FILE = os.environ.get("SWEEPER_LOCK_FILE", "/tmp/rena_sweeper.lock")
 
 if USE_PG:
     import psycopg2
@@ -46,8 +62,20 @@ def _today_jst():
 
 def _conn():
     if USE_PG:
-        return psycopg2.connect(DATABASE_URL)
-    return sqlite3.connect(os.environ.get("DB_PATH", "rena.db"))
+        return psycopg2.connect(DATABASE_URL, connect_timeout=DB_CONNECT_TIMEOUT)
+    return sqlite3.connect(
+        os.environ.get("DB_PATH", "rena.db"), timeout=DB_CONNECT_TIMEOUT
+    )
+
+
+@contextmanager
+def _db():
+    """DB 接続を必ず close するコンテキストマネージャ。commit は呼び出し側で行う。"""
+    c = _conn()
+    try:
+        yield c
+    finally:
+        c.close()
 
 
 def _ph(sql):
@@ -55,34 +83,37 @@ def _ph(sql):
 
 
 def _init_db():
-    c = _conn()
-    cur = c.cursor()
-    cur.execute(_ph("""
-        CREATE TABLE IF NOT EXISTS licenses (
-            license_key TEXT PRIMARY KEY,
-            hwid TEXT,
-            expiry_date TEXT,
-            max_launches INTEGER DEFAULT 0,
-            launch_count INTEGER DEFAULT 0,
-            active INTEGER DEFAULT 1,
-            created_at TEXT,
-            last_seen_ts DOUBLE PRECISION DEFAULT 0
-        )
-    """))
-    cur.execute(_ph("""
-        CREATE TABLE IF NOT EXISTS sessions (
-            token TEXT PRIMARY KEY,
-            license_key TEXT,
-            hwid TEXT,
-            created_at DOUBLE PRECISION,
-            last_heartbeat DOUBLE PRECISION
-        )
-    """))
-    c.commit()
-    c.close()
+    with _db() as c:
+        cur = c.cursor()
+        cur.execute(_ph("""
+            CREATE TABLE IF NOT EXISTS licenses (
+                license_key TEXT PRIMARY KEY,
+                hwid TEXT,
+                expiry_date TEXT,
+                max_launches INTEGER DEFAULT 0,
+                launch_count INTEGER DEFAULT 0,
+                active INTEGER DEFAULT 1,
+                created_at TEXT,
+                last_seen_ts DOUBLE PRECISION DEFAULT 0
+            )
+        """))
+        cur.execute(_ph("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                token TEXT PRIMARY KEY,
+                license_key TEXT,
+                hwid TEXT,
+                created_at DOUBLE PRECISION,
+                last_heartbeat DOUBLE PRECISION
+            )
+        """))
+        c.commit()
 
 
-_init_db()
+try:
+    _init_db()
+except Exception as e:
+    # ここで落とすとヘルスチェック前にプロセスが死ぬ。起動は継続。
+    print(f"[init_db] ERROR: {e}")
 
 
 def _check_admin(data):
@@ -103,23 +134,22 @@ def _expire_sweep():
     today_str = _today_jst().isoformat()
     affected = 0
     try:
-        c = _conn()
-        cur = c.cursor()
-        cur.execute(_ph(
-            "UPDATE licenses SET active=0 "
-            "WHERE active=1 AND expiry_date IS NOT NULL AND expiry_date < ?"
-        ), (today_str,))
-        affected = cur.rowcount if cur.rowcount is not None else 0
+        with _db() as c:
+            cur = c.cursor()
+            cur.execute(_ph(
+                "UPDATE licenses SET active=0 "
+                "WHERE active=1 AND expiry_date IS NOT NULL AND expiry_date < ?"
+            ), (today_str,))
+            affected = cur.rowcount if cur.rowcount is not None else 0
 
-        # 期限切れキーのセッションも無効化
-        cur.execute(_ph(
-            "DELETE FROM sessions WHERE license_key IN ("
-            "  SELECT license_key FROM licenses "
-            "  WHERE active=0 AND expiry_date IS NOT NULL AND expiry_date < ?"
-            ")"
-        ), (today_str,))
-        c.commit()
-        c.close()
+            # 期限切れキーのセッションも無効化
+            cur.execute(_ph(
+                "DELETE FROM sessions WHERE license_key IN ("
+                "  SELECT license_key FROM licenses "
+                "  WHERE active=0 AND expiry_date IS NOT NULL AND expiry_date < ?"
+                ")"
+            ), (today_str,))
+            c.commit()
     except Exception as e:
         print(f"[expire_sweep] ERROR: {e}")
         return 0
@@ -155,10 +185,23 @@ def _start_expire_sweeper():
         _sweeper_started = True
 
     def loop():
+        global _last_sweep_ts
+
+        # gunicorn の worker が複数でもスイーパーは1プロセスだけ動かす
+        lock_handle = None
+        if fcntl is not None:
+            try:
+                lock_handle = open(SWEEPER_LOCK_FILE, "w")
+                fcntl.flock(lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                print("[expire_sweep] another worker holds lock; sweeper skipped")
+                if lock_handle:
+                    lock_handle.close()
+                return
+
         while True:
             try:
                 _expire_sweep()
-                global _last_sweep_ts
                 _last_sweep_ts = time.time()
             except Exception as e:
                 print(f"[expire_sweep thread] {e}")
@@ -170,7 +213,10 @@ def _start_expire_sweeper():
 
 
 # 起動時に既存の期限切れを一掃 → 常駐スレッド起動
-_expire_sweep()
+try:
+    _expire_sweep()
+except Exception as e:
+    print(f"[startup sweep] ERROR: {e}")
 _last_sweep_ts = time.time()
 _start_expire_sweeper()
 
@@ -178,6 +224,9 @@ _start_expire_sweeper()
 # ---- リクエスト毎の保険スイープ ----
 @app.before_request
 def _sweep_on_request():
+    # ヘルスチェックは DB に触らない（DB不調でインスタンスが落ちるのを防ぐ）
+    if request.path == "/":
+        return
     try:
         _maybe_sweep()
     except Exception as e:
@@ -210,79 +259,73 @@ def activate():
     if not key or not hwid:
         return jsonify({"ok": False, "reason": "キーまたはHWIDが空です"}), 400
 
-    c = _conn()
-    cur = c.cursor()
-    cur.execute(_ph(
-        "SELECT hwid, expiry_date, max_launches, launch_count, active "
-        "FROM licenses WHERE license_key=?"
-    ), (key,))
-    row = cur.fetchone()
+    with _db() as c:
+        cur = c.cursor()
+        cur.execute(_ph(
+            "SELECT hwid, expiry_date, max_launches, launch_count, active "
+            "FROM licenses WHERE license_key=?"
+        ), (key,))
+        row = cur.fetchone()
 
-    if not row:
-        c.close()
-        return jsonify({"ok": False, "reason": "ライセンスキーが存在しません"}), 404
+        if not row:
+            return jsonify({"ok": False, "reason": "ライセンスキーが存在しません"}), 404
 
-    stored_hwid, expiry_date, max_launches, launch_count, active = row
+        stored_hwid, expiry_date, max_launches, launch_count, active = row
 
-    # 期限チェック (期限切れの場合は自動で active = 0 に更新)
-    if expiry_date:
-        try:
-            exp = datetime.strptime(expiry_date, "%Y-%m-%d").date()
-            if _today_jst() > exp:
+        # 期限チェック (期限切れの場合は自動で active = 0 に更新)
+        if expiry_date:
+            try:
+                exp = datetime.strptime(expiry_date, "%Y-%m-%d").date()
+            except ValueError:
+                exp = None
+            if exp is not None and _today_jst() > exp:
                 if active:
                     cur.execute(_ph("UPDATE licenses SET active=0 WHERE license_key=?"), (key,))
                     c.commit()
-                c.close()
                 return jsonify({"ok": False,
                                 "reason": f"有効期限切れ ({expiry_date})"}), 403
-        except ValueError:
-            pass
 
-    if not active:
-        c.close()
-        return jsonify({"ok": False, "reason": "このライセンスは停止中です"}), 403
+        if not active:
+            return jsonify({"ok": False, "reason": "このライセンスは停止中です"}), 403
 
-    # HWID バインド (初回)
-    if not stored_hwid:
-        cur.execute(_ph("UPDATE licenses SET hwid=? WHERE license_key=?"),
-                    (hwid, key))
-    elif stored_hwid != hwid:
-        c.close()
+        # HWID バインド (初回)
+        if not stored_hwid:
+            cur.execute(_ph("UPDATE licenses SET hwid=? WHERE license_key=?"),
+                        (hwid, key))
+        elif stored_hwid != hwid:
+            return jsonify({
+                "ok": False,
+                "reason": "このキーは別のPCに紐付いています。管理者にHWリセットを依頼してください。"
+            }), 403
+
+        # 起動回数
+        launch_count = (launch_count or 0) + 1
+        if max_launches and max_launches > 0 and launch_count > max_launches:
+            return jsonify({"ok": False,
+                            "reason": "起動回数の上限に達しました"}), 403
+
+        cur.execute(_ph(
+            "UPDATE licenses SET launch_count=?, last_seen_ts=? WHERE license_key=?"
+        ), (launch_count, time.time(), key))
+
+        # 同キーの旧セッションは破棄 (1PC = 1セッション)
+        cur.execute(_ph("DELETE FROM sessions WHERE license_key=?"), (key,))
+
+        token = secrets.token_urlsafe(48)
+        now = time.time()
+        cur.execute(_ph(
+            "INSERT INTO sessions (token, license_key, hwid, created_at, last_heartbeat) "
+            "VALUES (?,?,?,?,?)"
+        ), (token, key, hwid, now, now))
+        c.commit()
+
         return jsonify({
-            "ok": False,
-            "reason": "このキーは別のPCに紐付いています。管理者にHWリセットを依頼してください。"
-        }), 403
-
-    # 起動回数
-    launch_count = (launch_count or 0) + 1
-    if max_launches and max_launches > 0 and launch_count > max_launches:
-        c.close()
-        return jsonify({"ok": False,
-                        "reason": "起動回数の上限に達しました"}), 403
-
-    cur.execute(_ph(
-        "UPDATE licenses SET launch_count=?, last_seen_ts=? WHERE license_key=?"
-    ), (launch_count, time.time(), key))
-
-    # 同キーの旧セッションは破棄 (1PC = 1セッション)
-    cur.execute(_ph("DELETE FROM sessions WHERE license_key=?"), (key,))
-
-    token = secrets.token_urlsafe(48)
-    now = time.time()
-    cur.execute(_ph(
-        "INSERT INTO sessions (token, license_key, hwid, created_at, last_heartbeat) "
-        "VALUES (?,?,?,?,?)"
-    ), (token, key, hwid, now, now))
-    c.commit()
-    c.close()
-
-    return jsonify({
-        "ok": True,
-        "token": token,
-        "expiry": expiry_date,
-        "launch_count": launch_count,
-        "max_launches": max_launches
-    })
+            "ok": True,
+            "token": token,
+            "expiry": expiry_date,
+            "launch_count": launch_count,
+            "max_launches": max_launches
+        })
 
 
 @app.route("/api/heartbeat", methods=["POST"])
@@ -294,63 +337,58 @@ def heartbeat():
     if not token or not hwid:
         return jsonify({"ok": False, "reason": "トークンまたはHWIDがありません"}), 400
 
-    c = _conn()
-    cur = c.cursor()
-    cur.execute(_ph("SELECT license_key, hwid FROM sessions WHERE token=?"),
-                (token,))
-    row = cur.fetchone()
-    if not row:
-        c.close()
-        return jsonify({"ok": False, "reason": "セッションが無効です"}), 401
+    with _db() as c:
+        cur = c.cursor()
+        cur.execute(_ph("SELECT license_key, hwid FROM sessions WHERE token=?"),
+                    (token,))
+        row = cur.fetchone()
+        if not row:
+            return jsonify({"ok": False, "reason": "セッションが無効です"}), 401
 
-    license_key, stored_hwid = row
-    if stored_hwid != hwid:
-        c.close()
-        return jsonify({"ok": False, "reason": "HWIDが一致しません"}), 401
+        license_key, stored_hwid = row
+        if stored_hwid != hwid:
+            return jsonify({"ok": False, "reason": "HWIDが一致しません"}), 401
 
-    cur.execute(_ph(
-        "SELECT expiry_date, max_launches, launch_count, active "
-        "FROM licenses WHERE license_key=?"
-    ), (license_key,))
-    lic = cur.fetchone()
-    if not lic:
-        c.close()
-        return jsonify({"ok": False, "reason": "ライセンスが見つかりません"}), 404
+        cur.execute(_ph(
+            "SELECT expiry_date, max_launches, launch_count, active "
+            "FROM licenses WHERE license_key=?"
+        ), (license_key,))
+        lic = cur.fetchone()
+        if not lic:
+            return jsonify({"ok": False, "reason": "ライセンスが見つかりません"}), 404
 
-    expiry_date, max_launches, launch_count, active = lic
+        expiry_date, max_launches, launch_count, active = lic
 
-    # 期限チェック
-    if expiry_date:
-        try:
-            exp = datetime.strptime(expiry_date, "%Y-%m-%d").date()
-            if _today_jst() > exp:
+        # 期限チェック
+        if expiry_date:
+            try:
+                exp = datetime.strptime(expiry_date, "%Y-%m-%d").date()
+            except ValueError:
+                exp = None
+            if exp is not None and _today_jst() > exp:
                 if active:
-                    cur.execute(_ph("UPDATE licenses SET active=0 WHERE license_key=?"), (license_key,))
+                    cur.execute(_ph("UPDATE licenses SET active=0 WHERE license_key=?"),
+                                (license_key,))
                     c.commit()
-                c.close()
                 return jsonify({"ok": False,
                                 "reason": f"有効期限切れ ({expiry_date})"}), 403
-        except ValueError:
-            pass
 
-    if not active:
-        c.close()
-        return jsonify({"ok": False, "reason": "ライセンスが停止中です"}), 403
+        if not active:
+            return jsonify({"ok": False, "reason": "ライセンスが停止中です"}), 403
 
-    now = time.time()
-    cur.execute(_ph("UPDATE sessions SET last_heartbeat=? WHERE token=?"),
-                (now, token))
-    cur.execute(_ph("UPDATE licenses SET last_seen_ts=? WHERE license_key=?"),
-                (now, license_key))
-    c.commit()
-    c.close()
+        now = time.time()
+        cur.execute(_ph("UPDATE sessions SET last_heartbeat=? WHERE token=?"),
+                    (now, token))
+        cur.execute(_ph("UPDATE licenses SET last_seen_ts=? WHERE license_key=?"),
+                    (now, license_key))
+        c.commit()
 
-    return jsonify({
-        "ok": True,
-        "expiry": expiry_date,
-        "launch_count": launch_count,
-        "max_launches": max_launches
-    })
+        return jsonify({
+            "ok": True,
+            "expiry": expiry_date,
+            "launch_count": launch_count,
+            "max_launches": max_launches
+        })
 
 
 # ===================================================================
@@ -372,19 +410,19 @@ def admin_generate():
     count = max(1, int(data.get("count", 1)))
 
     keys = []
-    c = _conn()
-    cur = c.cursor()
-    for _ in range(count):
-        k = secrets.token_hex(16).upper()
-        cur.execute(_ph(
-            "INSERT INTO licenses (license_key, hwid, expiry_date, "
-            "max_launches, launch_count, active, created_at, last_seen_ts) "
-            "VALUES (?,?,?,?,?,?,?,?)"
-        ), (k, None, expiry, max_launches, 0, 1,
-            datetime.utcnow().isoformat(), 0))
-        keys.append(k)
-    c.commit()
-    c.close()
+    with _db() as c:
+        cur = c.cursor()
+        for _ in range(count):
+            k = secrets.token_hex(16).upper()
+            cur.execute(_ph(
+                "INSERT INTO licenses (license_key, hwid, expiry_date, "
+                "max_launches, launch_count, active, created_at, last_seen_ts) "
+                "VALUES (?,?,?,?,?,?,?,?)"
+            ), (k, None, expiry, max_launches, 0, 1,
+                datetime.utcnow().isoformat(), 0))
+            keys.append(k)
+        c.commit()
+
     return jsonify({"ok": True, "keys": keys})
 
 
@@ -400,12 +438,12 @@ def admin_reset_hwid():
     if not key:
         return jsonify({"ok": False, "reason": "キーが空です"}), 400
 
-    c = _conn()
-    cur = c.cursor()
-    cur.execute(_ph("UPDATE licenses SET hwid=NULL WHERE license_key=?"), (key,))
-    cur.execute(_ph("DELETE FROM sessions WHERE license_key=?"), (key,))
-    c.commit()
-    c.close()
+    with _db() as c:
+        cur = c.cursor()
+        cur.execute(_ph("UPDATE licenses SET hwid=NULL WHERE license_key=?"), (key,))
+        cur.execute(_ph("DELETE FROM sessions WHERE license_key=?"), (key,))
+        c.commit()
+
     return jsonify({"ok": True, "reason": "HWIDをリセットしました"})
 
 
@@ -422,12 +460,12 @@ def admin_set_expiry():
         return jsonify({"ok": False, "reason": "キーが空です"}), 400
     expiry = data.get("expiry")
 
-    c = _conn()
-    cur = c.cursor()
-    cur.execute(_ph("UPDATE licenses SET expiry_date=? WHERE license_key=?"),
-                (expiry, key))
-    c.commit()
-    c.close()
+    with _db() as c:
+        cur = c.cursor()
+        cur.execute(_ph("UPDATE licenses SET expiry_date=? WHERE license_key=?"),
+                    (expiry, key))
+        c.commit()
+
     return jsonify({"ok": True,
                     "reason": f"期限を {expiry or '無期限'} に設定しました"})
 
@@ -445,14 +483,14 @@ def admin_toggle():
     if not key:
         return jsonify({"ok": False, "reason": "キーが空です"}), 400
 
-    c = _conn()
-    cur = c.cursor()
-    cur.execute(_ph("UPDATE licenses SET active=? WHERE license_key=?"),
-                (active, key))
-    if not active:
-        cur.execute(_ph("DELETE FROM sessions WHERE license_key=?"), (key,))
-    c.commit()
-    c.close()
+    with _db() as c:
+        cur = c.cursor()
+        cur.execute(_ph("UPDATE licenses SET active=? WHERE license_key=?"),
+                    (active, key))
+        if not active:
+            cur.execute(_ph("DELETE FROM sessions WHERE license_key=?"), (key,))
+        c.commit()
+
     return jsonify({"ok": True,
                     "reason": "有効化しました" if active else "停止しました"})
 
@@ -469,17 +507,16 @@ def admin_delete():
     if not key:
         return jsonify({"ok": False, "reason": "キーが空です"}), 400
 
-    c = _conn()
-    cur = c.cursor()
-    cur.execute(_ph("SELECT 1 FROM licenses WHERE license_key=?"), (key,))
-    if not cur.fetchone():
-        c.close()
-        return jsonify({"ok": False, "reason": "キーが存在しません"}), 404
+    with _db() as c:
+        cur = c.cursor()
+        cur.execute(_ph("SELECT 1 FROM licenses WHERE license_key=?"), (key,))
+        if not cur.fetchone():
+            return jsonify({"ok": False, "reason": "キーが存在しません"}), 404
 
-    cur.execute(_ph("DELETE FROM sessions WHERE license_key=?"), (key,))
-    cur.execute(_ph("DELETE FROM licenses WHERE license_key=?"), (key,))
-    c.commit()
-    c.close()
+        cur.execute(_ph("DELETE FROM sessions WHERE license_key=?"), (key,))
+        cur.execute(_ph("DELETE FROM licenses WHERE license_key=?"), (key,))
+        c.commit()
+
     return jsonify({"ok": True, "reason": "ライセンスを削除しました"})
 
 
@@ -492,14 +529,15 @@ def admin_info():
     if not _check_admin(data):
         return jsonify({"ok": False, "reason": "Unauthorized"}), 401
     key = (data.get("license_key") or "").strip()
-    c = _conn()
-    cur = c.cursor()
-    cur.execute(_ph(
-        "SELECT license_key, hwid, expiry_date, max_launches, launch_count, "
-        "active, created_at, last_seen_ts FROM licenses WHERE license_key=?"
-    ), (key,))
-    row = cur.fetchone()
-    c.close()
+
+    with _db() as c:
+        cur = c.cursor()
+        cur.execute(_ph(
+            "SELECT license_key, hwid, expiry_date, max_launches, launch_count, "
+            "active, created_at, last_seen_ts FROM licenses WHERE license_key=?"
+        ), (key,))
+        row = cur.fetchone()
+
     if not row:
         return jsonify({"ok": False, "reason": "キーが存在しません"}), 404
     return jsonify({
@@ -524,23 +562,23 @@ def admin_list():
     if not _check_admin(data):
         return jsonify({"ok": False, "reason": "Unauthorized"}), 401
 
-    c = _conn()
-    cur = c.cursor()
-
-    # 一覧取得時にも念のため期限切れを一括停止（JST基準）
     today_str = _today_jst().isoformat()
-    cur.execute(_ph(
-        "UPDATE licenses SET active = 0 WHERE active = 1 "
-        "AND expiry_date IS NOT NULL AND expiry_date < ?"
-    ), (today_str,))
-    c.commit()
+    with _db() as c:
+        cur = c.cursor()
 
-    cur.execute(_ph(
-        "SELECT license_key, hwid, expiry_date, max_launches, launch_count, "
-        "active, created_at FROM licenses ORDER BY created_at DESC"
-    ))
-    rows = cur.fetchall()
-    c.close()
+        # 一覧取得時にも念のため期限切れを一括停止（JST基準）
+        cur.execute(_ph(
+            "UPDATE licenses SET active = 0 WHERE active = 1 "
+            "AND expiry_date IS NOT NULL AND expiry_date < ?"
+        ), (today_str,))
+        c.commit()
+
+        cur.execute(_ph(
+            "SELECT license_key, hwid, expiry_date, max_launches, launch_count, "
+            "active, created_at FROM licenses ORDER BY created_at DESC"
+        ))
+        rows = cur.fetchall()
+
     keys = [{
         "license_key": r[0],
         "hwid": r[1],
@@ -577,14 +615,13 @@ def admin_sweeper_status():
     today_str = _today_jst().isoformat()
     pending = -1
     try:
-        c = _conn()
-        cur = c.cursor()
-        cur.execute(_ph(
-            "SELECT COUNT(*) FROM licenses "
-            "WHERE active=1 AND expiry_date IS NOT NULL AND expiry_date < ?"
-        ), (today_str,))
-        pending = cur.fetchone()[0]
-        c.close()
+        with _db() as c:
+            cur = c.cursor()
+            cur.execute(_ph(
+                "SELECT COUNT(*) FROM licenses "
+                "WHERE active=1 AND expiry_date IS NOT NULL AND expiry_date < ?"
+            ), (today_str,))
+            pending = cur.fetchone()[0]
     except Exception as e:
         print(f"[sweeper_status] {e}")
 
