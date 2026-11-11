@@ -14,6 +14,10 @@ RENA License Server (サーバー.py)
   3) /admin/expire_sweep : 外部cronから叩ける
 
 日付判定はすべて JST（日本時間 UTC+9）基準。
+新規発行キー: duration_days=利用日数、activated_at=NULL、expiry_date=NULL。
+初回の /api/activate 成功時に開始日と有効期限を確定。
+従来の /admin/generate expiry=YYYY-MM-DD は発行日からの利用日数に変換。
+既存DBの旧キー(duration_days=NULL)は従来の固定期限方式のまま維持。
 
 [修正内容]
 - DB 接続に connect_timeout を設定（ハング防止）
@@ -94,7 +98,9 @@ def _init_db():
                 launch_count INTEGER DEFAULT 0,
                 active INTEGER DEFAULT 1,
                 created_at TEXT,
-                last_seen_ts DOUBLE PRECISION DEFAULT 0
+                last_seen_ts DOUBLE PRECISION DEFAULT 0,
+                duration_days INTEGER,
+                activated_at TEXT
             )
         """))
         cur.execute(_ph("""
@@ -106,7 +112,59 @@ def _init_db():
                 last_heartbeat DOUBLE PRECISION
             )
         """))
+        # 既存DBを壊さず新しいカラムだけ追加する。
+        if USE_PG:
+            cur.execute("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS duration_days INTEGER")
+            cur.execute("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS activated_at TEXT")
+        else:
+            cur.execute("PRAGMA table_info(licenses)")
+            existing = {row[1] for row in cur.fetchall()}
+            if "duration_days" not in existing:
+                cur.execute("ALTER TABLE licenses ADD COLUMN duration_days INTEGER")
+            if "activated_at" not in existing:
+                cur.execute("ALTER TABLE licenses ADD COLUMN activated_at TEXT")
         c.commit()
+
+
+def _duration_from_expiry(expiry):
+    """従来クライアントの期限日を『今から何日分』に変換する。Noneは無期限。"""
+    if expiry is None or expiry == "":
+        return None
+    try:
+        requested = date.fromisoformat(str(expiry))
+    except (ValueError, TypeError):
+        raise ValueError("期限は YYYY-MM-DD 形式で指定してください")
+    days = (requested - _today_jst()).days
+    if days < 0:
+        raise ValueError("過去の日付ではキーを発行できません")
+    return days
+
+
+def _duration_from_request(data):
+    """新形式 duration_days があれば優先。旧形式 expiry も利用可能。"""
+    if "duration_days" in data:
+        raw = data["duration_days"]
+        if raw is None or raw == "":
+            return None
+        if isinstance(raw, bool):
+            raise ValueError("利用日数が不正です")
+        try:
+            days = int(raw)
+        except (ValueError, TypeError):
+            raise ValueError("利用日数は整数で指定してください")
+        if str(raw).strip() != str(days) or days < 0 or days > 36500:
+            raise ValueError("利用日数は0〜36500の整数で指定してください")
+        return days
+    return _duration_from_expiry(data.get("expiry"))
+
+
+def _is_pending(duration_days, activated_at):
+    return duration_days is not None and not activated_at
+
+
+def _expiry_for_start(duration_days):
+    """初回利用日を基点に確定。有効期限日は従来通り当日いっぱい有効。"""
+    return (_today_jst() + timedelta(days=duration_days)).isoformat()
 
 
 try:
@@ -138,7 +196,8 @@ def _expire_sweep():
             cur = c.cursor()
             cur.execute(_ph(
                 "UPDATE licenses SET active=0 "
-                "WHERE active=1 AND expiry_date IS NOT NULL AND expiry_date < ?"
+                "WHERE active=1 AND expiry_date IS NOT NULL AND expiry_date < ? "
+                "AND NOT (duration_days IS NOT NULL AND activated_at IS NULL)"
             ), (today_str,))
             affected = cur.rowcount if cur.rowcount is not None else 0
 
@@ -146,7 +205,8 @@ def _expire_sweep():
             cur.execute(_ph(
                 "DELETE FROM sessions WHERE license_key IN ("
                 "  SELECT license_key FROM licenses "
-                "  WHERE active=0 AND expiry_date IS NOT NULL AND expiry_date < ?"
+                "  WHERE active=0 AND expiry_date IS NOT NULL AND expiry_date < ? "
+                "  AND NOT (duration_days IS NOT NULL AND activated_at IS NULL)"
                 ")"
             ), (today_str,))
             c.commit()
@@ -255,76 +315,66 @@ def activate():
     data = request.get_json(silent=True) or {}
     key = (data.get("license_key") or "").strip()
     hwid = (data.get("hwid") or "").strip()
-
     if not key or not hwid:
         return jsonify({"ok": False, "reason": "キーまたはHWIDが空です"}), 400
 
     with _db() as c:
         cur = c.cursor()
+        # 2台が同時に初回認証しても開始日/HWIDは一度だけ確定する。
+        # PostgreSQLは行ロック、SQLiteは書込トランザクションで直列化。
+        if not USE_PG:
+            cur.execute("BEGIN IMMEDIATE")
         cur.execute(_ph(
-            "SELECT hwid, expiry_date, max_launches, launch_count, active "
-            "FROM licenses WHERE license_key=?"
+            "SELECT hwid, expiry_date, max_launches, launch_count, active, "
+            "duration_days, activated_at FROM licenses WHERE license_key=?" +
+            (" FOR UPDATE" if USE_PG else "")
         ), (key,))
         row = cur.fetchone()
-
         if not row:
             return jsonify({"ok": False, "reason": "ライセンスキーが存在しません"}), 404
 
-        stored_hwid, expiry_date, max_launches, launch_count, active = row
+        stored_hwid, expiry_date, max_launches, launch_count, active, duration_days, activated_at = row
+        if not active:
+            return jsonify({"ok": False, "reason": "このライセンスは停止中です"}), 403
+        if stored_hwid and stored_hwid != hwid:
+            return jsonify({"ok": False, "reason": "このキーは別のPCに紐付いています。管理者にHWリセットを依頼してください。"}), 403
 
-        # 期限チェック (期限切れの場合は自動で active = 0 に更新)
-        if expiry_date:
+        next_count = (launch_count or 0) + 1
+        if max_launches and max_launches > 0 and next_count > max_launches:
+            return jsonify({"ok": False, "reason": "起動回数の上限に達しました"}), 403
+
+        first_use = _is_pending(duration_days, activated_at)
+        if first_use:
+            expiry_date = _expiry_for_start(duration_days)
+            activated_at = datetime.now(JST).isoformat()
+        elif expiry_date:
             try:
-                exp = datetime.strptime(expiry_date, "%Y-%m-%d").date()
+                exp = date.fromisoformat(expiry_date)
             except ValueError:
-                exp = None
-            if exp is not None and _today_jst() > exp:
+                return jsonify({"ok": False, "reason": "保存された有効期限が不正です"}), 500
+            if _today_jst() > exp:
                 if active:
                     cur.execute(_ph("UPDATE licenses SET active=0 WHERE license_key=?"), (key,))
                     c.commit()
-                return jsonify({"ok": False,
-                                "reason": f"有効期限切れ ({expiry_date})"}), 403
+                return jsonify({"ok": False, "reason": f"有効期限切れ ({expiry_date})"}), 403
 
-        if not active:
-            return jsonify({"ok": False, "reason": "このライセンスは停止中です"}), 403
-
-        # HWID バインド (初回)
-        if not stored_hwid:
-            cur.execute(_ph("UPDATE licenses SET hwid=? WHERE license_key=?"),
-                        (hwid, key))
-        elif stored_hwid != hwid:
-            return jsonify({
-                "ok": False,
-                "reason": "このキーは別のPCに紐付いています。管理者にHWリセットを依頼してください。"
-            }), 403
-
-        # 起動回数
-        launch_count = (launch_count or 0) + 1
-        if max_launches and max_launches > 0 and launch_count > max_launches:
-            return jsonify({"ok": False,
-                            "reason": "起動回数の上限に達しました"}), 403
-
-        cur.execute(_ph(
-            "UPDATE licenses SET launch_count=?, last_seen_ts=? WHERE license_key=?"
-        ), (launch_count, time.time(), key))
-
-        # 同キーの旧セッションは破棄 (1PC = 1セッション)
-        cur.execute(_ph("DELETE FROM sessions WHERE license_key=?"), (key,))
-
-        token = secrets.token_urlsafe(48)
         now = time.time()
+        cur.execute(_ph(
+            "UPDATE licenses SET hwid=?, expiry_date=?, activated_at=?, "
+            "launch_count=?, last_seen_ts=? WHERE license_key=?"
+        ), (hwid, expiry_date, activated_at, next_count, now, key))
+        cur.execute(_ph("DELETE FROM sessions WHERE license_key=?"), (key,))
+        token = secrets.token_urlsafe(48)
         cur.execute(_ph(
             "INSERT INTO sessions (token, license_key, hwid, created_at, last_heartbeat) "
             "VALUES (?,?,?,?,?)"
         ), (token, key, hwid, now, now))
         c.commit()
-
         return jsonify({
-            "ok": True,
-            "token": token,
-            "expiry": expiry_date,
-            "launch_count": launch_count,
-            "max_launches": max_launches
+            "ok": True, "token": token, "expiry": expiry_date,
+            "launch_count": next_count, "max_launches": max_launches,
+            "activated_at": activated_at, "duration_days": duration_days,
+            "first_use": first_use
         })
 
 
@@ -421,33 +471,35 @@ def heartbeat():
 
 @app.route("/admin/generate", methods=["POST"])
 def admin_generate():
-    """キー発行
-    { "admin_secret":"...", "expiry":"2026-12-31" or null,
-      "max_launches":0, "count":1 }
-    """
+    """キー作り置き: duration_days または旧形式 expiry（発行日からの日数）を指定。"""
     data = request.get_json(silent=True) or {}
     if not _check_admin(data):
         return jsonify({"ok": False, "reason": "Unauthorized"}), 401
-
-    expiry = data.get("expiry")            # "YYYY-MM-DD" or None
-    max_launches = int(data.get("max_launches", 0))
-    count = max(1, int(data.get("count", 1)))
+    try:
+        days = _duration_from_request(data)
+        max_launches = int(data.get("max_launches", 0))
+        count = int(data.get("count", 1))
+        if not 1 <= count <= 1000 or max_launches < 0:
+            raise ValueError("発行数は1〜1000、起動上限は0以上で指定してください")
+    except (TypeError, ValueError) as e:
+        return jsonify({"ok": False, "reason": str(e)}), 400
 
     keys = []
     with _db() as c:
         cur = c.cursor()
         for _ in range(count):
             k = secrets.token_hex(16).upper()
+            # 未使用キーには期限日を入れない。初回の認証成功で確定する。
             cur.execute(_ph(
                 "INSERT INTO licenses (license_key, hwid, expiry_date, "
-                "max_launches, launch_count, active, created_at, last_seen_ts) "
-                "VALUES (?,?,?,?,?,?,?,?)"
-            ), (k, None, expiry, max_launches, 0, 1,
-                datetime.utcnow().isoformat(), 0))
+                "max_launches, launch_count, active, created_at, last_seen_ts, "
+                "duration_days, activated_at) VALUES (?,?,?,?,?,?,?,?,?,?)"
+            ), (k, None, None, max_launches, 0, 1,
+                datetime.now(JST).isoformat(), 0, days, None))
             keys.append(k)
         c.commit()
-
-    return jsonify({"ok": True, "keys": keys})
+    return jsonify({"ok": True, "keys": keys, "duration_days": days,
+                    "starts_on_first_use": days is not None})
 
 
 @app.route("/admin/reset_hwid", methods=["POST"])
@@ -473,25 +525,41 @@ def admin_reset_hwid():
 
 @app.route("/admin/set_expiry", methods=["POST"])
 def admin_set_expiry():
-    """有効期限を設定 / 変更 / 無期限化
-    { "admin_secret":"...", "license_key":"...", "expiry":"2026-12-31" or null }
-    """
+    """未使用キーは日数を変更、使用済みキーは従来通り期限日を変更。"""
     data = request.get_json(silent=True) or {}
     if not _check_admin(data):
         return jsonify({"ok": False, "reason": "Unauthorized"}), 401
     key = (data.get("license_key") or "").strip()
     if not key:
         return jsonify({"ok": False, "reason": "キーが空です"}), 400
-    expiry = data.get("expiry")
-
     with _db() as c:
         cur = c.cursor()
-        cur.execute(_ph("UPDATE licenses SET expiry_date=? WHERE license_key=?"),
-                    (expiry, key))
+        cur.execute(_ph("SELECT duration_days, activated_at FROM licenses WHERE license_key=?"), (key,))
+        row = cur.fetchone()
+        if not row:
+            return jsonify({"ok": False, "reason": "キーが存在しません"}), 404
+        pending = _is_pending(*row)
+        if pending:
+            try:
+                days = _duration_from_request(data)
+            except ValueError as e:
+                return jsonify({"ok": False, "reason": str(e)}), 400
+            # None = 永久。永久へ変更しても使用開始日を記録しない設計。
+            cur.execute(_ph("UPDATE licenses SET duration_days=?, expiry_date=NULL WHERE license_key=?"), (days, key))
+            reason = f"未使用キーの利用期間を {days}日 に変更しました" if days is not None else "未使用キーを無期限に変更しました"
+        else:
+            expiry = data.get("expiry")
+            if expiry is not None and expiry != "":
+                try:
+                    date.fromisoformat(str(expiry))
+                except ValueError:
+                    return jsonify({"ok": False, "reason": "期限はYYYY-MM-DD形式です"}), 400
+            else:
+                expiry = None
+            cur.execute(_ph("UPDATE licenses SET expiry_date=? WHERE license_key=?"), (expiry, key))
+            reason = f"期限を {expiry or '無期限'} に設定しました"
         c.commit()
-
-    return jsonify({"ok": True,
-                    "reason": f"期限を {expiry or '無期限'} に設定しました"})
+    return jsonify({"ok": True, "reason": reason})
 
 
 @app.route("/admin/toggle", methods=["POST"])
@@ -558,7 +626,7 @@ def admin_info():
         cur = c.cursor()
         cur.execute(_ph(
             "SELECT license_key, hwid, expiry_date, max_launches, launch_count, "
-            "active, created_at, last_seen_ts FROM licenses WHERE license_key=?"
+            "active, created_at, last_seen_ts, duration_days, activated_at FROM licenses WHERE license_key=?"
         ), (key,))
         row = cur.fetchone()
 
@@ -574,6 +642,9 @@ def admin_info():
         "active": bool(row[5]),
         "created_at": row[6],
         "last_seen_ts": row[7],
+        "duration_days": row[8],
+        "activated_at": row[9],
+        "pending": _is_pending(row[8], row[9]),
     })
 
 
@@ -593,13 +664,15 @@ def admin_list():
         # 一覧取得時にも念のため期限切れを一括停止（JST基準）
         cur.execute(_ph(
             "UPDATE licenses SET active = 0 WHERE active = 1 "
-            "AND expiry_date IS NOT NULL AND expiry_date < ?"
+            "AND expiry_date IS NOT NULL AND expiry_date < ? "
+            "AND NOT (duration_days IS NOT NULL AND activated_at IS NULL)"
         ), (today_str,))
         c.commit()
 
         cur.execute(_ph(
             "SELECT license_key, hwid, expiry_date, max_launches, launch_count, "
-            "active, created_at FROM licenses ORDER BY created_at DESC"
+            "active, created_at, duration_days, activated_at "
+            "FROM licenses ORDER BY created_at DESC"
         ))
         rows = cur.fetchall()
 
@@ -611,6 +684,9 @@ def admin_list():
         "launch_count": r[4],
         "active": bool(r[5]),
         "created_at": r[6],
+        "duration_days": r[7],
+        "activated_at": r[8],
+        "pending": _is_pending(r[7], r[8]),
     } for r in rows]
     return jsonify({"ok": True, "licenses": keys})
 
@@ -643,7 +719,8 @@ def admin_sweeper_status():
             cur = c.cursor()
             cur.execute(_ph(
                 "SELECT COUNT(*) FROM licenses "
-                "WHERE active=1 AND expiry_date IS NOT NULL AND expiry_date < ?"
+                "WHERE active=1 AND expiry_date IS NOT NULL AND expiry_date < ? "
+                "AND NOT (duration_days IS NOT NULL AND activated_at IS NULL)"
             ), (today_str,))
             pending = cur.fetchone()[0]
     except Exception as e:
