@@ -19,12 +19,12 @@ RENA License Server (サーバー.py)
 従来の /admin/generate expiry=YYYY-MM-DD は発行日からの利用日数に変換。
 既存DBの旧キー(duration_days=NULL)は従来の固定期限方式のまま維持。
 
-[修正内容]
-- DB 接続に connect_timeout を設定（ハング防止）
-- 全 DB 操作を contextmanager で close 保証（接続枯渇防止）
-- 起動時の init / sweep 失敗でプロセスが落ちないように
-- ヘルスチェックでは sweep をスキップ
-- スイーパースレッドの多重起動をファイルロックで防止
+[負荷軽減版]
+- 小さなDB接続プール（プロセスごと、接続上限設定可）
+- ハートビートの有効性検査は毎回、最終アクセス書き込みは60秒間隔
+- 期限切れ一括スイープは既定10分間隔（期限切れ判定は各APIで即時）
+- 既存のAPIレスポンスとDBスキーマ、HWID仕様は維持
+- DB接続不能時は503を返す（認証成功扱いにはしない）
 """
 import os
 import time
@@ -45,12 +45,34 @@ app = Flask(__name__)
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "change_me_please")
 USE_PG = DATABASE_URL.startswith("postgres")
-SWEEP_INTERVAL = int(os.environ.get("EXPIRE_SWEEP_INTERVAL", 60))  # 秒
+SWEEP_INTERVAL = max(60, int(os.environ.get("EXPIRE_SWEEP_INTERVAL", 600)))  # 秒
 DB_CONNECT_TIMEOUT = int(os.environ.get("DB_CONNECT_TIMEOUT", 5))  # 秒
 SWEEPER_LOCK_FILE = os.environ.get("SWEEPER_LOCK_FILE", "/tmp/rena_sweeper.lock")
+HEARTBEAT_WRITE_INTERVAL = max(10, int(os.environ.get("HEARTBEAT_WRITE_INTERVAL", 60)))
+DB_POOL_MAX = max(1, int(os.environ.get("DB_POOL_MAX", 3)))
 
 if USE_PG:
     import psycopg2
+    from psycopg2.pool import ThreadedConnectionPool
+
+_pool_lock = threading.Lock()
+_pg_pool = None
+_pg_pool_pid = None
+
+
+def _get_pool():
+    """ワーカープロセスごとに遅延生成（fork 前の接続共有を回避）。"""
+    global _pg_pool, _pg_pool_pid
+    pid = os.getpid()
+    with _pool_lock:
+        if _pg_pool is None or _pg_pool_pid != pid:
+            _pg_pool = ThreadedConnectionPool(
+                minconn=0, maxconn=DB_POOL_MAX,
+                dsn=DATABASE_URL, connect_timeout=DB_CONNECT_TIMEOUT,
+                application_name="crex-license-server",
+            )
+            _pg_pool_pid = pid
+        return _pg_pool
 
 
 # ===================================================================
@@ -64,22 +86,39 @@ def _today_jst():
     return datetime.now(JST).date()
 
 
-def _conn():
-    if USE_PG:
-        return psycopg2.connect(DATABASE_URL, connect_timeout=DB_CONNECT_TIMEOUT)
-    return sqlite3.connect(
-        os.environ.get("DB_PATH", "rena.db"), timeout=DB_CONNECT_TIMEOUT
-    )
-
-
 @contextmanager
 def _db():
-    """DB 接続を必ず close するコンテキストマネージャ。commit は呼び出し側で行う。"""
-    c = _conn()
+    """PostgreSQLは小さなプールで接続を再利用。返却時は未完了TXをrollback。"""
+    if not USE_PG:
+        c = sqlite3.connect(os.environ.get("DB_PATH", "rena.db"), timeout=DB_CONNECT_TIMEOUT)
+        try:
+            yield c
+        finally:
+            try:
+                c.rollback()
+            finally:
+                c.close()
+        return
+
+    pool = _get_pool()
+    c = pool.getconn()
+    discard = False
     try:
+        if c.closed:
+            discard = True
+            raise psycopg2.OperationalError("closed pooled connection")
         yield c
+    except (psycopg2.OperationalError, psycopg2.InterfaceError):
+        discard = True
+        raise
     finally:
-        c.close()
+        try:
+            if not c.closed:
+                # commit していない SELECT・早期return等を確実に解除
+                c.rollback()
+        except (psycopg2.OperationalError, psycopg2.InterfaceError):
+            discard = True
+        pool.putconn(c, close=discard or bool(c.closed))
 
 
 def _ph(sql):
@@ -389,18 +428,18 @@ def validate_start():
 
     with _db() as c:
         cur = c.cursor()
-        cur.execute(_ph("SELECT license_key, hwid FROM sessions WHERE token=?"), (token,))
+        cur.execute(_ph("SELECT license_key, hwid, last_heartbeat FROM sessions WHERE token=?"), (token,))
         row = cur.fetchone()
         if not row:
             return jsonify({"ok": False, "reason": "セッションが無効です"}), 401
-        license_key, session_hwid = row
+        license_key, session_hwid, previous_heartbeat = row
         cur.execute(_ph(
-            "SELECT hwid, expiry_date, max_launches, launch_count, active "
+            "SELECT hwid, expiry_date, max_launches, launch_count, active, last_seen_ts "
             "FROM licenses WHERE license_key=?"), (license_key,))
         lic = cur.fetchone()
         if not lic:
             return jsonify({"ok": False, "reason": "ライセンスが見つかりません"}), 404
-        license_hwid, expiry_date, max_launches, launch_count, active = lic
+        license_hwid, expiry_date, max_launches, launch_count, active, previous_seen = lic
         if session_hwid != hwid or license_hwid != hwid:
             return jsonify({"ok": False, "reason": "HWIDが一致しません。別のPCでは起動できません。"}), 403
         if expiry_date:
@@ -416,8 +455,11 @@ def validate_start():
         if not active:
             return jsonify({"ok": False, "reason": "ライセンスが停止中です"}), 403
         now = time.time()
-        cur.execute(_ph("UPDATE sessions SET last_heartbeat=? WHERE token=?"), (now, token))
-        cur.execute(_ph("UPDATE licenses SET last_seen_ts=? WHERE license_key=?"), (now, license_key))
+        # 有効性確認は毎回実施、書き込みのみ間引く。
+        if now - (previous_heartbeat or 0) >= HEARTBEAT_WRITE_INTERVAL:
+            cur.execute(_ph("UPDATE sessions SET last_heartbeat=? WHERE token=?"), (now, token))
+        if now - (previous_seen or 0) >= HEARTBEAT_WRITE_INTERVAL:
+            cur.execute(_ph("UPDATE licenses SET last_seen_ts=? WHERE license_key=?"), (now, license_key))
         c.commit()
         return jsonify({"ok": True, "expiry": expiry_date,
                         "launch_count": launch_count, "max_launches": max_launches})
@@ -433,18 +475,18 @@ def heartbeat():
 
     with _db() as c:
         cur = c.cursor()
-        cur.execute(_ph("SELECT license_key FROM sessions WHERE token=?"), (token,))
+        cur.execute(_ph("SELECT license_key, last_heartbeat FROM sessions WHERE token=?"), (token,))
         row = cur.fetchone()
         if not row:
             return jsonify({"ok": False, "reason": "セッションが無効です"}), 401
-        license_key = row[0]
+        license_key, previous_heartbeat = row
         cur.execute(_ph(
-            "SELECT expiry_date, max_launches, launch_count, active "
+            "SELECT expiry_date, max_launches, launch_count, active, last_seen_ts "
             "FROM licenses WHERE license_key=?"), (license_key,))
         lic = cur.fetchone()
         if not lic:
             return jsonify({"ok": False, "reason": "ライセンスが見つかりません"}), 404
-        expiry_date, max_launches, launch_count, active = lic
+        expiry_date, max_launches, launch_count, active, previous_seen = lic
         if expiry_date:
             try:
                 exp = datetime.strptime(expiry_date, "%Y-%m-%d").date()
@@ -458,8 +500,11 @@ def heartbeat():
         if not active:
             return jsonify({"ok": False, "reason": "ライセンスが停止中です"}), 403
         now = time.time()
-        cur.execute(_ph("UPDATE sessions SET last_heartbeat=? WHERE token=?"), (now, token))
-        cur.execute(_ph("UPDATE licenses SET last_seen_ts=? WHERE license_key=?"), (now, license_key))
+        # 有効性確認は毎回実施、書き込みのみ間引く。
+        if now - (previous_heartbeat or 0) >= HEARTBEAT_WRITE_INTERVAL:
+            cur.execute(_ph("UPDATE sessions SET last_heartbeat=? WHERE token=?"), (now, token))
+        if now - (previous_seen or 0) >= HEARTBEAT_WRITE_INTERVAL:
+            cur.execute(_ph("UPDATE licenses SET last_seen_ts=? WHERE license_key=?"), (now, license_key))
         c.commit()
         return jsonify({"ok": True, "expiry": expiry_date,
                         "launch_count": launch_count, "max_launches": max_launches})
@@ -737,6 +782,17 @@ def admin_sweeper_status():
         "pending_expired_active": pending,
     })
 
+
+
+@app.errorhandler(Exception)
+def _api_error(exc):
+    from werkzeug.exceptions import HTTPException
+    if isinstance(exc, HTTPException):
+        return exc
+    app.logger.exception("Unhandled server error")
+    if USE_PG and isinstance(exc, (psycopg2.OperationalError, psycopg2.InterfaceError)):
+        return jsonify({"ok": False, "reason": "データベースに一時的に接続できません。再試行してください"}), 503
+    return jsonify({"ok": False, "reason": "サーバー内部エラー"}), 500
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
